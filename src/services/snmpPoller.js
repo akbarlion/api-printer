@@ -1,53 +1,41 @@
 const cron = require('node-cron');
 const Printer = require('../models/Printer');
 const PrinterMetrics = require('../models/PrinterMetrics');
+const AlertService = require('./alertService');
 const { getPrinterMetrics } = require('./snmpService');
-const db = require('../config/database');
-
-const createAlert = async (printerId, printerName, alertType, severity, message) => {
-  try {
-    // Check if similar alert already exists and not acknowledged
-    const [existing] = await db.execute(
-      'SELECT id FROM printeralerts WHERE printerId = ? AND alertType = ? AND isAcknowledged = 0',
-      [printerId, alertType]
-    );
-    
-    if (existing.length === 0) {
-      await db.execute(
-        'INSERT INTO printeralerts (id, printerId, printerName, alertType, severity, message, isAcknowledged, createdAt) VALUES (UUID(), ?, ?, ?, ?, ?, 0, NOW())',
-        [printerId, printerName, alertType, severity, message]
-      );
-      console.log(`Alert created: ${alertType} for ${printerName}`);
-    }
-  } catch (error) {
-    console.error('Error creating alert:', error);
-  }
-};
-
-const checkForAlerts = async (printer, metrics) => {
-  // Check toner/ink levels
-  if (metrics.tonerLevel && metrics.tonerLevel < 20) {
-    await createAlert(printer.id, printer.name, 'toner_low', 'medium', `Toner level is ${metrics.tonerLevel}%`);
-  }
-  
-  if (metrics.blackLevel && metrics.blackLevel < 20) {
-    await createAlert(printer.id, printer.name, 'toner_low', 'medium', `Black ink level is ${metrics.blackLevel}%`);
-  }
-  
-  // Check paper status
-  if (metrics.paperTrayStatus && metrics.paperTrayStatus.toLowerCase().includes('empty')) {
-    await createAlert(printer.id, printer.name, 'paper_empty', 'high', 'Paper tray is empty');
-  }
-  
-  // Check device status
-  if (metrics.deviceStatus && metrics.deviceStatus.toLowerCase().includes('error')) {
-    await createAlert(printer.id, printer.name, 'error', 'critical', `Device error: ${metrics.deviceStatus}`);
-  }
-};
+const HPWebService = require('./hpWebService');
 
 const pollPrinter = async (printer) => {
   try {
-    const metrics = await getPrinterMetrics(printer.ipAddress);
+    let metrics;
+    
+    try {
+      // Try SNMP first
+      metrics = await getPrinterMetrics(printer.ipAddress);
+      
+      // If SNMP returns all 0% or null, try HP Web
+      const hasValidData = metrics.blackLevel > 0 || metrics.cyanLevel > 0 || 
+                          metrics.magentaLevel > 0 || metrics.yellowLevel > 0;
+      
+      if (!hasValidData && printer.model?.toLowerCase().includes('hp')) {
+        console.log(`SNMP returned 0% for ${printer.name}, trying HP Web...`);
+        const hpResult = await HPWebService.getInkLevels(printer.ipAddress);
+        if (hpResult.success) {
+          metrics = { ...metrics, ...hpResult.data };
+          console.log(`HP Web successful for ${printer.name}`);
+        }
+      }
+    } catch (snmpError) {
+      // If SNMP fails completely, try HP Web
+      console.log(`SNMP failed for ${printer.name}, trying HP Web...`);
+      const hpResult = await HPWebService.getInkLevels(printer.ipAddress);
+      if (hpResult.success) {
+        metrics = hpResult.data;
+        console.log(`HP Web fallback successful for ${printer.name}`);
+      } else {
+        throw snmpError; // Re-throw original SNMP error
+      }
+    }
     
     await PrinterMetrics.create({
       printerId: printer.id,
@@ -63,7 +51,7 @@ const pollPrinter = async (printer) => {
     });
     
     // Check for alerts
-    await checkForAlerts(printer, metrics);
+    await AlertService.checkAndCreateAlerts(printer.id, printer.name, metrics);
     
     await printer.update({
       status: 'online',
@@ -78,7 +66,7 @@ const pollPrinter = async (printer) => {
     });
     
     // Create offline alert
-    await createAlert(printer.id, printer.name, 'offline', 'critical', 'Printer is offline');
+    await AlertService.createOfflineAlert(printer.id, printer.name);
     
     console.error(`Failed to poll printer ${printer.name}:`, error.message);
   }
@@ -104,6 +92,10 @@ const startPollingScheduler = () => {
   // Poll every 30 seconds
   cron.schedule('*/30 * * * * *', pollAllPrinters);
   console.log('SNMP polling scheduler started (every 30 seconds)');
+  
+  // Cleanup old alerts daily at 2 AM
+  cron.schedule('0 2 * * *', AlertService.cleanupOldAlerts);
+  console.log('Alert cleanup scheduler started (daily at 2 AM)');
 };
 
 module.exports = {
